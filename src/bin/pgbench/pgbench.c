@@ -161,6 +161,11 @@ int			fillfactor = 100;
 bool		unlogged_tables = false;
 
 /*
+ * use Citus?
+ */
+bool		use_citus = false;
+
+/*
  * log sampling rate (1.0 = log everything, 0.0 = option not given)
  */
 double		sample_rate = 0.0;
@@ -579,6 +584,7 @@ usage(void)
 		   "  -i, --initialize         invokes initialization mode\n"
 		   "  -I, --init-steps=[dtgvpf]+ (default \"dtgvp\")\n"
 		   "                           run selected initialization steps\n"
+		   "  --citus                  use Citus distributed tables\n"
 		   "  -F, --fillfactor=NUM     set fill factor\n"
 		   "  -n, --no-vacuum          do not run VACUUM during initialization\n"
 		   "  -q, --quiet              quiet logging (one message each 5 seconds)\n"
@@ -1147,9 +1153,11 @@ static void
 executeStatement(PGconn *con, const char *sql)
 {
 	PGresult   *res;
+	ExecStatusType status;
 
 	res = PQexec(con, sql);
-	if (PQresultStatus(res) != PGRES_COMMAND_OK)
+	status = PQresultStatus(res);
+	if (status != PGRES_COMMAND_OK && status != PGRES_TUPLES_OK)
 	{
 		fprintf(stderr, "%s", PQerrorMessage(con));
 		exit(1);
@@ -3598,6 +3606,8 @@ initCreateTables(PGconn *con)
 		const char *table;		/* table name */
 		const char *smcols;		/* column decls if accountIDs are 32 bits */
 		const char *bigcols;	/* column decls if accountIDs are 64 bits */
+		const char *distcol;
+		const char *colocatewith;
 		int			declare_fillfactor;
 	};
 	static const struct ddlinfo DDLs[] = {
@@ -3605,24 +3615,32 @@ initCreateTables(PGconn *con)
 			"pgbench_history",
 			"tid int,bid int,aid    int,delta int,mtime timestamp,filler char(22)",
 			"tid int,bid int,aid bigint,delta int,mtime timestamp,filler char(22)",
+			"aid",
+			"default",
 			0
 		},
 		{
 			"pgbench_tellers",
 			"tid int not null,bid int,tbalance int,filler char(84)",
 			"tid int not null,bid int,tbalance int,filler char(84)",
+			"tid",
+			"none",
 			1
 		},
 		{
 			"pgbench_accounts",
 			"aid    int not null,bid int,abalance int,filler char(84)",
 			"aid bigint not null,bid int,abalance int,filler char(84)",
+			"aid",
+			"pgbench_history",
 			1
 		},
 		{
 			"pgbench_branches",
 			"bid int not null,bbalance int,filler char(88)",
 			"bid int not null,bbalance int,filler char(88)",
+			"bid",
+			"none",
 			1
 		}
 	};
@@ -3660,6 +3678,15 @@ initCreateTables(PGconn *con)
 				 ddl->table, cols, opts);
 
 		executeStatement(con, buffer);
+
+		if (use_citus)
+		{
+			snprintf(buffer, sizeof(buffer),
+					 "SELECT create_distributed_table('%s','%s',colocate_with:='%s')",
+					 ddl->table, ddl->distcol, ddl->colocatewith);
+
+			executeStatement(con, buffer);
+		}
 	}
 }
 
@@ -3671,8 +3698,8 @@ initGenerateData(PGconn *con)
 {
 	char		sql[256];
 	PGresult   *res;
-	int			i;
 	int64		k;
+	PGconn **copyConns;
 
 	/* used to track elapsed time and estimate of the remaining time */
 	instr_time	start,
@@ -3680,6 +3707,7 @@ initGenerateData(PGconn *con)
 	double		elapsed_sec,
 				remaining_sec;
 	int			log_interval = 1;
+	int connIndex = 0;
 
 	fprintf(stderr, "generating data...\n");
 
@@ -3687,62 +3715,69 @@ initGenerateData(PGconn *con)
 	 * we do all of this in one transaction to enable the backend's
 	 * data-loading optimizations
 	 */
-	executeStatement(con, "begin");
+	//executeStatement(con, "begin");
 
 	/*
 	 * truncate away any old data, in one command in case there are foreign
 	 * keys
 	 */
+
+/*
 	executeStatement(con, "truncate table "
 					 "pgbench_accounts, "
 					 "pgbench_branches, "
 					 "pgbench_history, "
 					 "pgbench_tellers");
+*/
 
 	/*
 	 * fill branches, tellers, accounts in that order in case foreign keys
 	 * already exist
 	 */
-	for (i = 0; i < nbranches * scale; i++)
-	{
-		/* "filler" column defaults to NULL */
-		snprintf(sql, sizeof(sql),
-				 "insert into pgbench_branches(bid,bbalance) values(%d,0)",
-				 i + 1);
-		executeStatement(con, sql);
-	}
+	snprintf(sql, sizeof(sql),
+			 "insert into pgbench_branches(bid,bbalance) "
+			 "select s, 0 FROM generate_series(1,%d) s",
+			 nbranches * scale);
+	executeStatement(con, sql);
 
-	for (i = 0; i < ntellers * scale; i++)
-	{
-		/* "filler" column defaults to NULL */
-		snprintf(sql, sizeof(sql),
-				 "insert into pgbench_tellers(tid,bid,tbalance) values (%d,%d,0)",
-				 i + 1, i / ntellers + 1);
-		executeStatement(con, sql);
-	}
+	snprintf(sql, sizeof(sql),
+			 "insert into pgbench_tellers(tid,bid,tbalance)"
+			 "select s, 1+(s-1)/%d, 0 from generate_series(1,%d) s",
+			 ntellers, ntellers * scale);
+	executeStatement(con, sql);
 
-	/*
-	 * accounts is big enough to be worth using COPY and tracking runtime
-	 */
-	res = PQexec(con, "copy pgbench_accounts from stdin");
-	if (PQresultStatus(res) != PGRES_COPY_IN)
+	copyConns = (PGconn **) pg_malloc0(nclients * sizeof(PGconn *));
+
+	for (connIndex = 0; connIndex < nclients; connIndex++)
 	{
-		fprintf(stderr, "%s", PQerrorMessage(con));
-		exit(1);
+		PGconn *copyConn = doConnect();
+
+		copyConns[connIndex] = copyConn;
+		/*
+		 * accounts is big enough to be worth using COPY and tracking runtime
+		 */
+		res = PQexec(copyConn, "copy pgbench_accounts from stdin");
+		if (PQresultStatus(res) != PGRES_COPY_IN)
+		{
+			fprintf(stderr, "%s", PQerrorMessage(copyConn));
+			exit(1);
+		}
+		PQclear(res);
 	}
-	PQclear(res);
 
 	INSTR_TIME_SET_CURRENT(start);
 
 	for (k = 0; k < (int64) naccounts * scale; k++)
 	{
+		uint64 connIndex = k % (int64) nclients;
+		PGconn *copyConn = copyConns[connIndex];
 		int64		j = k + 1;
 
 		/* "filler" column defaults to blank padded empty string */
 		snprintf(sql, sizeof(sql),
 				 INT64_FORMAT "\t" INT64_FORMAT "\t%d\t\n",
 				 j, k / naccounts + 1, 0);
-		if (PQputline(con, sql))
+		if (PQputline(copyConn, sql))
 		{
 			fprintf(stderr, "PQputline failed\n");
 			exit(1);
@@ -3787,18 +3822,25 @@ initGenerateData(PGconn *con)
 		}
 
 	}
-	if (PQputline(con, "\\.\n"))
+
+	for (connIndex = 0; connIndex < nclients; connIndex++)
 	{
-		fprintf(stderr, "very last PQputline failed\n");
-		exit(1);
-	}
-	if (PQendcopy(con))
-	{
-		fprintf(stderr, "PQendcopy failed\n");
-		exit(1);
+		PGconn *copyConn = copyConns[connIndex];
+
+		if (PQputline(copyConn, "\\.\n"))
+		{
+			fprintf(stderr, "very last PQputline failed\n");
+			exit(1);
+		}
+		if (PQendcopy(copyConn))
+		{
+			fprintf(stderr, "PQendcopy failed\n");
+			exit(1);
+		}
+		PQfinish(copyConn);
 	}
 
-	executeStatement(con, "commit");
+	//executeStatement(con, "commit");
 }
 
 /*
@@ -3821,9 +3863,9 @@ static void
 initCreatePKeys(PGconn *con)
 {
 	static const char *const DDLINDEXes[] = {
-		"alter table pgbench_branches add primary key (bid)",
-		"alter table pgbench_tellers add primary key (tid)",
-		"alter table pgbench_accounts add primary key (aid)"
+		"alter table pgbench_branches add constraint pgbench_branches_pkey primary key (bid)",
+		"alter table pgbench_tellers add constraint pgbench_tellers_pkey primary key (tid)",
+		"alter table pgbench_accounts add constraint pgbench_accounts_pkey primary key (aid)"
 	};
 	int			i;
 
@@ -4894,6 +4936,7 @@ main(int argc, char **argv)
 		{"log-prefix", required_argument, NULL, 7},
 		{"foreign-keys", no_argument, NULL, 8},
 		{"random-seed", required_argument, NULL, 9},
+		{"citus", no_argument, NULL, 10},
 		{NULL, 0, NULL, 0}
 	};
 
@@ -5004,7 +5047,6 @@ main(int argc, char **argv)
 				debug++;
 				break;
 			case 'c':
-				benchmarking_option_set = true;
 				nclients = atoi(optarg);
 				if (nclients <= 0)
 				{
@@ -5250,6 +5292,9 @@ main(int argc, char **argv)
 					fprintf(stderr, "error while setting random seed from --random-seed option\n");
 					exit(1);
 				}
+				break;
+			case 10:			/* citus */
+				use_citus = true;
 				break;
 			default:
 				fprintf(stderr, _("Try \"%s --help\" for more information.\n"), progname);
